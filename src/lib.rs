@@ -11,19 +11,19 @@ pub mod math;
 pub mod reader;
 pub mod state;
 pub mod tokenizer;
+pub mod kernels;
+pub mod tests;
 
 use forward::forward;
 use reader::parse_general;
 use state::Header;
+use std::time::Instant;
+
 
 use crate::{
-    data::{Tensor, Transformer},
-    error::{ForwardPassError, GenerateError, MetaDataError, ModelLoadError, ReaderError},
-    reader::{parse_tensor_data, parse_tensors},
-    state::{
+    data::{Tensor, Transformer, Mode, Cache}, error::{ForwardPassError, GenerateError, MetaDataError, ModelLoadError, ReaderError}, math::rope_angles, reader::{parse_tensor_data, parse_tensors}, state::{
         GgufMetadataValue::*, GgufMetadataValueType::GGUF_METADATA_VALUE_TYPE_ARRAY, MetaDataField,
-    },
-    tokenizer::{decode, embed, encode, sample},
+    }, tokenizer::{decode, embed, encode, sample},
 };
 
 pub fn load_model<'a>(
@@ -96,6 +96,14 @@ pub fn load_model<'a>(
         }
     }
 
+    let mut mode = Mode::default();
+    #[cfg(feature = "q_act")]
+    {
+        mode = Mode::Quantize
+    }
+
+
+
     let transformer_info = Transformer {
         layers: layers.ok_or(MetaDataError::MissingField("Layers"))?,
         dim: dim.ok_or(MetaDataError::MissingField("Dimension"))?,
@@ -103,6 +111,7 @@ pub fn load_model<'a>(
         q_heads: q_heads.ok_or(MetaDataError::MissingField("Query Attention Heads"))?,
         k_v_heads: k_v_heads.ok_or(MetaDataError::MissingField("K/V Attention Heads"))?,
         base_freq: base_freq.ok_or(MetaDataError::MissingField("Rope Base Frequency"))?,
+        mode
     };
 
     let (read_tensors, offset) =
@@ -135,6 +144,8 @@ pub fn generate(
     tensor_data: &HashMap<String, &[u8]>,
     embed_tensor: &[u8],
 ) -> Result<String, GenerateError> {
+    let now = Instant::now();
+
     // Fetch tokenizer arrays from metadata
     let mut vocab = None;
     let mut merges = None;
@@ -153,8 +164,7 @@ pub fn generate(
     // Tokenize the input sentence
     let encoded = encode(vocab, merges, input)?;
 
-    let mut key_cache = vec![];
-    let mut value_cache = vec![];
+    let mut kv_cache = Cache::new();
     let mut logits = vec![];
 
     let mut pos = 0;
@@ -162,13 +172,14 @@ pub fn generate(
     // Prompt pass, run every prompt token through to fill the kv cache
     for token in encoded {
         let embedded = embed(token, embed_tensor, transformer.embed_dim);
-        (logits, key_cache, value_cache) = forward(
+        let angles = rope_angles(transformer.base_freq, pos, transformer.dim);
+        logits = forward(
             embedded,
             pos,
             transformer,
             tensor_data,
-            key_cache,
-            value_cache,
+            &mut kv_cache,
+            angles
         )?;
         pos += 1
     }
@@ -202,13 +213,15 @@ pub fn generate(
         let _ = std::io::stdout().flush();
 
         let embedded = embed(token_id, embed_tensor, transformer.embed_dim);
-        (logits, key_cache, value_cache) = forward(
+        let angles = rope_angles(transformer.base_freq, pos, transformer.dim);
+
+        logits = forward(
             embedded,
             pos,
             transformer,
             tensor_data,
-            key_cache,
-            value_cache,
+            &mut kv_cache,
+            angles
         )?;
 
         pos += 1
@@ -216,7 +229,88 @@ pub fn generate(
 
     let output = decode(vocab, &tokens)?;
 
+    println!("");
+    println!("Total: {}", now.elapsed().as_secs_f32());
+
     Ok(output)
+}
+
+// Generate up to a capped token count, return raw ids
+pub fn generate_capped(
+    input: &str,
+    cap: usize,
+    transformer: &Transformer,
+    metadata_info: &[MetaDataField],
+    tensor_data: &HashMap<String, &[u8]>,
+    embed_tensor: &[u8],
+) -> Result<Vec<usize>, GenerateError> {
+    // Fetch tokenizer arrays from metadata
+    let mut vocab = None;
+    let mut merges = None;
+
+    for field in metadata_info {
+        match field.name.as_str() {
+            "tokenizer.ggml.tokens" => vocab = Some(field),
+            "tokenizer.ggml.merges" => merges = Some(field),
+            _ => {}
+        }
+    }
+
+    let vocab = vocab.ok_or(MetaDataError::MissingField("ggml.tokens"))?;
+    let merges = merges.ok_or(MetaDataError::MissingField("ggml.merges"))?;
+
+    // Tokenize the input sentence
+    let encoded = encode(vocab, merges, input)?;
+
+    let mut kv_cache = Cache::new();
+    let mut logits = vec![];
+
+    let mut pos = 0;
+
+    // Prompt pass, run every prompt token through to fill the kv cache
+    for token in encoded {
+        let embedded = embed(token, embed_tensor, transformer.embed_dim);
+        let angles = rope_angles(transformer.base_freq, pos, transformer.dim);
+
+        logits = forward(
+            embedded,
+            pos,
+            transformer,
+            tensor_data,
+            &mut kv_cache,
+            angles
+        )?;
+        pos += 1
+    }
+
+    let mut tokens = vec![];
+
+    // break loop when we hit cap
+    loop {
+        
+        if tokens.len() >= cap {
+            break;
+        }
+
+        let token_id = sample(&logits);
+        tokens.push(token_id);
+
+        let embedded = embed(token_id, embed_tensor, transformer.embed_dim);
+        let angles = rope_angles(transformer.base_freq, pos, transformer.dim);
+
+        logits = forward(
+            embedded,
+            pos,
+            transformer,
+            tensor_data,
+            &mut kv_cache,
+            angles
+        )?;
+
+        pos += 1
+    }
+
+    Ok(tokens)
 }
 
 pub fn test_forward(
@@ -226,7 +320,9 @@ pub fn test_forward(
     // Mock token embedded
     let mock_token = vec![1.0; transformer.embed_dim];
 
-    let (logits, _, _) = forward(mock_token, 0, transformer, tensor_data, vec![], vec![])?;
+    let angles = rope_angles(transformer.base_freq, 0, transformer.dim);
+    let mut kv_cache = Cache::new();
+    let logits = forward(mock_token, 0, transformer, tensor_data, &mut kv_cache, angles)?;
     let token_id = sample(&logits);
     Ok(token_id.to_string())
 }
